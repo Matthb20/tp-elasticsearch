@@ -1,0 +1,119 @@
+# ==========================================
+# Partie 3 — Recherche et analyseurs
+# ==========================================
+
+# ------------------------------------------
+# Exercice 3.1 — Voir travailler un analyseur
+# ------------------------------------------
+
+POST _analyze
+{
+  "analyzer": "standard",
+  "text": "Les développeuses travaillaient sur l'analyse des données"
+}
+
+POST _analyze
+{
+  "analyzer": "french",
+  "text": "Les développeuses travaillaient sur l'analyse des données"
+}
+
+POST _analyze
+{
+  "analyzer": "standard",
+  "text": "donnée données"
+}
+
+POST _analyze
+{
+  "analyzer": "french",
+  "text": "donnée données"
+}
+
+# ------------------------------------------
+# Exercice 3.2 — match contre term
+# ------------------------------------------
+
+# Requête match originale (OR par défaut : 4190 résultats)
+GET offres/_search
+{
+  "query": {
+    "match": {
+      "description": "projets bancaires"
+    }
+  }
+}
+
+# Requête match avec operator AND (393 résultats)
+GET offres/_search
+{
+  "query": {
+    "match": {
+      "description": {
+        "query": "projets bancaires",
+        "operator": "and"
+      }
+    }
+  }
+}
+
+# Requête term corrigée pour ville (keyword sensible à la casse)
+GET offres/_search
+{
+  "query": {
+    "term": {
+      "ville": "Paris"
+    }
+  }
+}
+
+# Requête term corrigée pour titre (sur le sous-champ non analysé titre.brut)
+GET offres/_search
+{
+  "query": {
+    "term": {
+      "titre.brut": "Data Engineer Senior"
+    }
+  }
+}
+
+# ------------------------------------------
+# Exercice 3.3 — Plusieurs champs, pondération et fautes de frappe
+# ------------------------------------------
+
+# multi_match initial
+GET offres/_search
+{
+  "query": {
+    "multi_match": {
+      "query": "kubernetis terraform",
+      "fields": ["titre", "competences.texte", "description"]
+    }
+  }
+}
+
+# multi_match avec fuzziness AUTO
+GET offres/_search
+{
+  "query": {
+    "multi_match": {
+      "query": "kubernetis terraform",
+      "fields": ["titre", "competences.texte", "description"],
+      "fuzziness": "AUTO"
+    }
+  }
+}
+
+# multi_match avec boost titre^3
+GET offres/_search
+{
+  "query": {
+    "multi_match": {
+      "query": "kubernetis terraform",
+      "fields": ["titre^3", "competences.texte", "description"],
+      "fuzziness": "AUTO"
+    }
+  }
+}
+
+
