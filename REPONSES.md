@@ -436,3 +436,108 @@
 3. **Proposez deux solutions pour pouvoir rejouer ce fichier sans doublon :**
    - **Solution 1 (Gestion de sincedb) :** Ne pas désactiver sincedb (retirer `/dev/null`) pour que Logstash mémorise l'inœud du fichier et le dernier octet lu sur disque, évitant ainsi de relire des lignes déjà ingérées.
    - **Solution 2 (Déduplication par empreinte numérique - `fingerprint`) :** Utiliser le filtre `fingerprint` dans Logstash pour générer un hash SHA-256 unique basé sur la ligne (ex: IP + URL + date) stocké dans `[@metadata][fingerprint]`. Cela permettrait de filtrer les doublons avant l'envoi ou d'écrire dans un index dédupliqué.
+
+---
+
+## Partie 4 — Enquête dans Kibana
+
+### Exercice 4.1 — Vue d'ensemble du trafic
+
+1. **Quelle est la répartition des requêtes par code HTTP ?**
+   - `200` (Succès) : **17 805** (86,01 %)
+   - `201` (Création - candidatures) : **1 492** (7,21 %)
+   - `404` (Non trouvé) : **508** (2,45 %)
+   - `304` (Cache non modifié) : **488** (2,36 %)
+   - `503` (Service indisponible) : **402** (1,94 %)
+   - `500` (Erreur interne) : **5** (0,02 %)
+   - Total : **20 700** requêtes.
+
+2. **Quelle est la répartition par méthode HTTP ?**
+   - `GET` : **19 208** requêtes (92,79 %)
+   - `POST` : **1 492** requêtes (7,21 %) — correspondent exactement aux soumissions de candidatures (`/postuler`).
+
+3. **Quel est le volume moyen de requêtes par jour ?**
+   - Sur les 7 jours complets analysés (du 23 au 29 septembre 2026), le site enregistre en moyenne **2 957 requêtes par jour** (allant de 2 589 à 3 292 requêtes quotidiennes).
+
+---
+
+### Exercice 4.2 — L'incident de production
+
+1. **Jour et créneau précis de l'incident :**
+   - **Jour :** Lundi **28 septembre 2026**.
+   - **Créneau horaire UTC :** De **12:00:00Z à 12:45:00Z**.
+   - **Créneau en heure locale (Paris, UTC+2) :** De **14h00 à 14h45** (un après-midi).
+   - En resserrant par pas de 5 minutes, les erreurs démarrent pile à 12h00 et s'arrêtent net à 12h45 (9 tranches consécutives d'environ 45 erreurs).
+
+2. **Les URL touchées, et celles qui ne l'ont pas été :**
+   - **URL touchées :** Exclusivement les endpoints d'API de recherche d'offres : `/api/offres?ville=...&page=...` (concernant toutes les villes : Bordeaux, Lyon, Lille, Paris, Nantes, Montpellier, Toulouse).
+   - **URL non touchées :** Le reste du site fonctionnait normalement : page d'accueil (`/`), pages de recherche web (`/recherche`), fiches individuelles d'offres (`/offres/OFF-...`), et fichiers statiques (`/static/app.js`).
+
+3. **Nombre de réponses en erreur et durée :**
+   - Nombre d'erreurs : **402 réponses `503 Service Unavailable`** (ainsi que 5 erreurs 500 ponctuelles).
+   - Durée exacte : **45 minutes**.
+
+4. **Comportement des clients pendant l'incident :**
+   - Le volume de requêtes vers l'API est resté soutenu et régulier pendant toute la panne (~45 requêtes toutes les 5 minutes).
+   - **Explication :** Les clients (applications mobiles, scripts front-end ou utilisateurs rafraîchissant leur page) mettaient en œuvre des mécanismes de réessai automatique (*retry loop*) face au code 503, maintenant une charge constante jusqu'à la remise en service du service API à 14h45.
+
+---
+
+### Exercice 4.3 — L'activité suspecte (Cybersécurité)
+
+1. **Adresse IP à l'origine de la rafale de 404 :**
+   - Adresse IP : **`203.0.113.66`** (à elle seule, elle génère **300 réponses 404**).
+
+2. **Moment et durée de cette activité :**
+   - **Date :** Samedi **26 septembre 2026**.
+   - **Créneau :** De **01:12:00Z à 01:16:59Z** (soit de **03h12 à 03h17 du matin** en heure locale de Paris).
+   - **Durée :** Exactement **5 minutes** (cadence de 1 requête par seconde).
+
+3. **Les URL demandées : que cherchait ce robot ?**
+   - URL scannées : `/admin` (59 fois), `/.git/config` (55 fois), `/.env` (53 fois), `/phpmyadmin/` (46 fois), `/server-status` (44 fois), `/wp-login.php` (43 fois).
+   - **Intention :** C'est un scan automatisé de vulnérabilités et de fuites d'informations sensibles (*reconnaissance / credential harvesting*). Le robot cherchait à voler le code source via un dossier Git exposé, à dérober des mots de passe dans un fichier `.env`, ou à trouver des interfaces d'administration non protégées (WordPress, phpMyAdmin).
+
+4. **Son `user_agent.original` : comment le distinguer d'un navigateur ?**
+   - Chaîne user-agent : **`Mozilla/5.0 zgrab/0.x`**.
+   - **Distinction :** Bien qu'il tente d'imiter un navigateur avec le préfixe `Mozilla/5.0`, il contient le mot explicite **`zgrab/0.x`** (un scanner de bannières réseau open source). De plus, il ne mentionne aucun moteur de rendu moderne (Gecko, WebKit) ni aucun système d'exploitation réel.
+
+5. **D'où viennent les autres erreurs 404 ? Sont-elles inquiétantes ?**
+   - Les 208 autres erreurs 404 ciblent des URL du type `/offres/OFF-09223`, `/offres/OFF-09347`, etc.
+   - **Explication :** L'index `offres` ne contient que les offres de `OFF-00001` à `OFF-05000`. Ces requêtes correspondent à de vrais candidats cliquant sur d'anciennes offres supprimées, des annonces expirées ou des favoris obsolètes.
+   - **Conclusion :** Elles ne sont absolument pas inquiétantes : c'est le cycle de vie normal d'un site d'emploi.
+
+---
+
+### Exercice 4.4 — Les 10 offres les plus consultées
+
+Top 10 des offres les plus consultées (requêtes `GET` avec statut `200`) et détails récupérés dans l'index `offres` :
+
+| Identifiant (`labels.offre_id`) | Nombre de vues | Titre du poste | Ville | Contrat |
+| :--- | :---: | :--- | :--- | :--- |
+| **OFF-04662** | 8 | Développeur Front-end Senior | Bordeaux | Freelance |
+| **OFF-03141** | 7 | Développeur Python Confirmé | Bordeaux | CDI |
+| **OFF-01153** | 7 | Développeur Java Confirmé | Toulouse | Freelance |
+| **OFF-03145** | 6 | Data Engineer Lead | Montpellier | CDI |
+| **OFF-01275** | 6 | Administrateur Bases de Données Lead | Paris | CDI |
+| **OFF-01660** | 6 | Architecte Cloud Senior | Lyon | CDI |
+| **OFF-03524** | 6 | Développeur Python (Alternance) | Toulouse | Alternance |
+| **OFF-00901** | 6 | Développeur Java Junior | Paris | CDI |
+| **OFF-03923** | 6 | Architecte Cloud Confirmé | Lyon | CDI |
+| **OFF-03126** | 6 | Administrateur Bases de Données Junior | Lyon | CDI |
+
+*Requête Dev Tools utilisée : `GET offres/_search` avec filtre `ids` sur ces 10 identifiants.*
+
+---
+
+### Exercice 4.5 — Analyse de l'audience (OS et Navigateurs)
+
+1. **Part du trafic provenant d'appareils mobiles (`user_agent.os.name`) :**
+   - **Android :** 4 056 requêtes (19,6 %)
+   - **iOS :** 4 099 requêtes (19,8 %)
+   - **Part mobile totale :** **8 155 requêtes sur 20 700**, soit **39,4 %** du trafic global.
+   - Le reste du trafic provient de systèmes desktop : Mac OS X (4 150), Windows (4 058), Linux (4 037), et le scanner zgrab (300).
+
+2. **Les 3 navigateurs les plus utilisés (`user_agent.name`) :**
+   - **1. Safari / Mobile Safari :** 8 249 requêtes combinées (4 150 desktop + 4 099 mobile).
+   - **2. Chrome / Chrome Mobile :** 8 114 requêtes combinées (4 058 desktop + 4 056 mobile).
+   - **3. Firefox :** 4 037 requêtes (uniquement sur desktop Linux).

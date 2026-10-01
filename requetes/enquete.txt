@@ -1,0 +1,130 @@
+# =============================================================================
+# REQUETES ENQUETE KIBANA (KQL & ES|QL) — TP 2 PARTIE 4
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Exercice 4.1 — Vue d'ensemble du trafic
+# -----------------------------------------------------------------------------
+
+# KQL (Barre de recherche Discover)
+# Filtrer par code HTTP spécifique :
+http.response.status_code: 200
+http.request.method: "GET"
+
+# ES|QL : Répartition par code HTTP
+FROM logs-web-default
+| STATS count = COUNT(*) BY http.response.status_code
+| SORT count DESC
+
+# ES|QL : Répartition par méthode HTTP
+FROM logs-web-default
+| STATS count = COUNT(*) BY http.request.method
+| SORT count DESC
+
+# ES|QL : Volume par jour
+FROM logs-web-default
+| STATS requetes = COUNT(*) BY jour = BUCKET(@timestamp, 1 day)
+| SORT jour ASC
+
+
+# -----------------------------------------------------------------------------
+# Exercice 4.2 — L'incident (Erreurs serveur 5xx)
+# -----------------------------------------------------------------------------
+
+# KQL (Discover) : Cibler toutes les erreurs serveur
+http.response.status_code >= 500
+
+# ES|QL : Étape 1 - Localiser le jour et l'heure de l'incident (pas d'1 heure)
+FROM logs-web-default
+| WHERE http.response.status_code >= 500
+| STATS erreurs = COUNT(*) BY heure = BUCKET(@timestamp, 1 hour)
+| SORT erreurs DESC
+
+# ES|QL : Étape 2 - Resserrez le créneau précis (pas de 5 minutes)
+FROM logs-web-default
+| WHERE http.response.status_code >= 500 AND @timestamp >= "2026-09-28T12:00:00Z" AND @timestamp <= "2026-09-28T13:00:00Z"
+| STATS erreurs = COUNT(*) BY cren = BUCKET(@timestamp, 5 minutes)
+| SORT cren ASC
+
+# ES|QL : Étape 3 - URLs touchées par les erreurs 503 / 500
+FROM logs-web-default
+| WHERE http.response.status_code >= 500
+| STATS n_erreurs = COUNT(*) BY url.original, http.response.status_code
+| SORT n_erreurs DESC
+
+
+# -----------------------------------------------------------------------------
+# Exercice 4.3 — L'activité suspecte (Le robot d'exploration)
+# -----------------------------------------------------------------------------
+
+# KQL (Discover) : Isoler les requêtes 404 ou l'IP du robot
+http.response.status_code: 404
+source.address: "203.0.113.66"
+
+# ES|QL : Identifier l'adresse IP à l'origine de la rafale de 404
+FROM logs-web-default
+| WHERE http.response.status_code == 404
+| STATS n_404 = COUNT(*) BY source.address
+| SORT n_404 DESC
+| LIMIT 5
+
+# ES|QL : Identifier la période d'activité et le User-Agent du robot
+FROM logs-web-default
+| WHERE source.address == "203.0.113.66"
+| STATS total = COUNT(*), debut = MIN(@timestamp), fin = MAX(@timestamp) BY user_agent.original
+
+# ES|QL : Quelles URLs le robot ciblait-il ?
+FROM logs-web-default
+| WHERE source.address == "203.0.113.66"
+| STATS requetes = COUNT(*) BY url.original, http.response.status_code
+| SORT requetes DESC
+| LIMIT 20
+
+# ES|QL : Analyse des 404 résiduelles (hors robot)
+FROM logs-web-default
+| WHERE http.response.status_code == 404 AND source.address != "203.0.113.66"
+| STATS n = COUNT(*) BY url.original
+| SORT n DESC
+| LIMIT 10
+
+
+# -----------------------------------------------------------------------------
+# Exercice 4.4 — Les 10 offres les plus consultées
+# -----------------------------------------------------------------------------
+
+# ES|QL : Top 10 des offres (GET avec code 200)
+FROM logs-web-default
+| WHERE http.request.method == "GET" AND http.response.status_code == 200 AND labels.offre_id IS NOT NULL
+| STATS consultations = COUNT(*) BY labels.offre_id
+| SORT consultations DESC
+| LIMIT 10
+
+# Requête Dev Tools Elasticsearch pour récupérer les détails de ces 10 offres
+GET offres/_search
+{
+  "query": {
+    "ids": {
+      "values": [
+        "OFF-04662", "OFF-03141", "OFF-01153", "OFF-03145", "OFF-01275",
+        "OFF-01660", "OFF-03524", "OFF-00901", "OFF-03923", "OFF-03126"
+      ]
+    }
+  },
+  "_source": ["id", "titre", "ville", "contrat"]
+}
+
+
+# -----------------------------------------------------------------------------
+# Exercice 4.5 — Le public (OS et Navigateurs)
+# -----------------------------------------------------------------------------
+
+# ES|QL : Répartition par OS
+FROM logs-web-default
+| STATS total = COUNT(*) BY user_agent.os.name
+| SORT total DESC
+
+# ES|QL : Top navigateurs
+FROM logs-web-default
+| STATS total = COUNT(*) BY user_agent.name
+| SORT total DESC
+| LIMIT 10
