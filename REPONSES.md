@@ -357,3 +357,82 @@
 3. **Pourquoi le `document_id` de la partie 1 devient-il alors indispensable ?**
    - Avec la garantie « au moins une fois », un événement déjà transmis juste avant un crash peut être renvoyé une deuxième fois au redémarrage.
    - En fournissant un identifiant déterministe (`document_id => "%{id}"`), Elasticsearch procède à une mise à jour (*upsert*) du document existant au lieu de créer un doublon. L'idempotence transforme ainsi le « au moins une fois » en un résultat **« exactement une fois »** (*exactly once*) effectif dans la base.
+
+---
+
+## Partie 3 — Transformer les logs d'accès
+
+### Exercice 3.2 — Mettre au point le motif (Grok Debugger)
+
+1. **Quels champs sont extraits par le motif `%{COMBINEDAPACHELOG}` ?**
+   - `source.address` : adresse IP du client (`203.0.113.123`).
+   - `http.request.method` : méthode HTTP (`GET`, `POST`...).
+   - `url.original` : chemin de la ressource demandée (`/offres/OFF-01468`).
+   - `http.version` : version du protocole HTTP (`1.1`).
+   - `http.response.status_code` : code de statut HTTP (`200`, `404`, `500`...).
+   - `http.response.body.bytes` : taille du corps de réponse en octets (`43686`).
+   - `http.request.referrer` : URL de provenance / référent.
+   - `user_agent.original` : chaîne brute du navigateur / user agent.
+   - `timestamp` : date et heure brute du serveur web (`23/Sep/2026:00:00:39 +0200`).
+
+2. **Sous quel type apparaît `http.response.status_code` ?**
+   - Dans la sortie brute de `grok`, il est extrait sous forme de chaîne de caractères (`string` / texte `"200"`). Mais une fois injecté dans Elasticsearch dans le template `logs-*-*`, il est automatiquement casté en entier (`long`).
+
+3. **Pourquoi `timestamp` doit-il encore être traité ?**
+   - Parce que `grok` n'extrait qu'une simple chaîne textuelle non interprétée. Pour qu'Elasticsearch et Kibana puissent classer, filtrer par période et tracer des histogrammes temporels, cette date doit être convertie au format officiel ISO-8601 UTC et enregistrée dans le champ spécial **`@timestamp`** grâce au filtre `date`.
+
+4. **Quel motif extrait `OFF-01468` de l'URL `/offres/OFF-01468/postuler` ?**
+   - On définit le motif personnalisé :
+     ```text
+     pattern_definitions => { "OFFRE_ID" => "OFF-[0-9]{5}" }
+     match => { "[url][original]" => "^/offres/%{OFFRE_ID:[labels][offre_id]}" }
+     ```
+   - Cela capture `OFF-01468` et le stocke proprement dans `labels.offre_id`.
+
+---
+
+### Exercice 3.4 — Vérifier le data stream
+
+1. **Combien de documents (attendu : 20 700) et combien d'échecs de grok (attendu : 0) ?**
+   - Nombre total de documents : **20 700** (`GET logs-web-default/_count`).
+   - Échecs de grok : **0** (`GET logs-web-default/_count` avec `tags: "_grokparsefailure"` renvoie `0`).
+
+2. **Quel est le nom de l'index caché (*backing index*) qui contient les données, et que signifie chaque partie de ce nom ?**
+   - Nom de l'index : **`.ds-logs-web-default-2026.10.01-000001`**
+   - Signification de chaque partie :
+     - `.ds-` : indique un index interne caché géré automatiquement par un Data Stream.
+     - `logs` : le type de données (*type*).
+     - `web` : le nom du jeu de données / source (*dataset*).
+     - `default` : l'espace de nommage logique (*namespace*).
+     - `2026.10.01` : date de création de l'index en UTC.
+     - `000001` : numéro de génération du rollover ILM (s'incrémente lors d'un cycle de vie d'index).
+
+3. **Le premier événement est-il daté du 23/09/2026 à 00:00:39 (+02:00), soit 22:00:39 UTC la veille ?**
+   - Oui, la requête de tri `sort: [{"@timestamp": "asc"}]` affiche exactement :
+     `"@timestamp": "2026-09-22T22:00:39.000Z"`.
+   - Le filtre `date` a parfaitement appliqué le décalage `+0200` pour normaliser l'horodatage en UTC standard.
+
+4. **Quel type a reçu `http.response.status_code`, et pourquoi est-ce important pour la suite ?**
+   - Il a reçu le type **`long`** (nombre entier).
+   - C'est indispensable pour l'enquête et les dashboards afin de :
+     - Faire des filtres numériques d'intervalle (ex: `http.response.status_code >= 500` pour toutes les erreurs serveur 5xx).
+     - Calculer des formules statistiques (ex: taux d'erreur serveur avec `count(kql='http.response.status_code >= 500') / count()`).
+
+5. **Quel `index.mode` est utilisé ?**
+   - Le mode utilisé est **`logsdb`**.
+   - C'est le mode haute performance d'Elasticsearch 9 dédié aux logs temporels, qui optimise le stockage, l'indexation et la compression sur disque.
+
+---
+
+### Exercice 3.5 — Rejouer sans doublon ?
+
+1. **Que constatez-vous en redémarrant Logstash, et pourquoi le problème ne se posait-il pas pour `offres` ?**
+   - En redémarrant avec `sincedb_path => "/dev/null"` et sans `document_id`, Logstash relit l'intégralité du fichier et le nombre de documents passe à **41 400** (tous les logs sont insérés en doublon).
+   - Pour l'index `offres`, le problème ne se posait pas car nous avions fixé `document_id => "%{id}"` sur un index classique, ce qui écrasait en place (*upsert*) les documents existants sans créer de doublon.
+
+2. **Peut-on mettre à jour ou remplacer un document dans un data stream ?**
+   - **NON.** Par définition, un Data Stream Elasticsearch est conçu pour des flux d'événements temporels en **ajout seul (append-only)** (`op_type: create`). Elasticsearch n'autorise pas la mise à jour ou le remplacement direct de documents dans un data stream.
+
+3. **Proposez deux solutions pour pouvoir rejouer ce fichier sans doublon :**
+   - **Solution 1 (Gestion de sincedb) :** Ne pas désactiver sincedb (retirer `/dev/null`) pour que Logstash mémorise l'inœud du fichier et le dernier octet lu sur disque, évitant ainsi de relire des lignes déjà ingérées.
+   - **Solution 2 (Déduplication par empreinte numérique - `fingerprint`) :** Utiliser le filtre `fingerprint` dans Logstash pour générer un hash SHA-256 unique basé sur la ligne (ex: IP + URL + date) stocké dans `[@metadata][fingerprint]`. Cela permettrait de filtrer les doublons avant l'envoi ou d'écrire dans un index dédupliqué.
