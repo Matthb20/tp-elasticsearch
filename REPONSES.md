@@ -201,3 +201,75 @@
 2. **L'agrégation porte-t-elle sur tout l'index ou seulement sur la requête ?**
    - Elle porte uniquement sur les 919 offres qui correspondent au `match` "Data Engineer".
    - La clause `query` filtre les documents en premier, puis l'agrégation calcule ses stats sur ce résultat.
+
+---
+
+# TP 2 — Logstash & Analyse de Logs
+
+## Mise en place — Sécurité & Compte dédié
+
+1. **Pourquoi ne pas utiliser le compte `elastic` pour Logstash ?**
+   - Par principe du moindre privilège : `elastic` est le super-administrateur avec tous les droits sur l'ensemble du cluster. Si Logstash avait un problème de configuration ou était compromis, il pourrait effacer des index système ou d'autres données. En lui créant un compte dédié `logstash_internal` avec le rôle `logstash_writer`, on limite strictement ses droits aux index `offres` et aux flux `logs-web-*`.
+
+2. **Que se passerait-il si le pipeline `web` tentait d'écrire dans `logs-generic-default` ?**
+   - Elasticsearch refuserait l'écriture avec une erreur HTTP `403 Forbidden` (`security_exception`). Le rôle `logstash_writer` n'accorde de droits d'écriture que sur `offres` et `logs-web-*`. Tout autre index ou data stream est immédiatement bloqué.
+
+3. **Pourquoi le mot de passe est-il transmis par variable d'environnement plutôt qu'écrit dans les fichiers `.conf` ?**
+   - Pour ne jamais committer de mot de passe en clair dans Git. Les fichiers `.conf` font partie du code source et sont versionnés sur GitHub, alors que le fichier `.env` est ignoré par Git. On injecte donc `${ES_PASSWORD}` à la volée.
+
+---
+
+## Exercice 0 — Premier pipeline Logstash
+
+1. **Quels champs Logstash a-t-il ajoutés à votre phrase ?**
+   - `@version` : la version du format interne d'événement de Logstash (`"1"`).
+   - `@timestamp` : l'horodatage UTC ISO-8601 de l'événement.
+   - `host.hostname` : le nom d'hôte ou l'identifiant du conteneur qui fait tourner Logstash.
+   - `event.original` : la copie brute du message non altéré (conforme au standard ECS).
+   - *(Le contenu saisi se retrouve quant à lui dans le champ `message`)*.
+
+2. **Que contient `@timestamp` : l'heure de quoi ?**
+   - Il contient l'heure exacte à laquelle Logstash **a ingéré/lu** la ligne. Ce n'est pas l'heure de production de l'événement d'origine. Pour les fichiers de logs (qui datent souvent du passé), il est indispensable d'utiliser le filtre `date` pour remplacer ce `@timestamp` par la date réelle du log.
+
+3. **À quoi sert l'option `--path.data /tmp/essai` ?**
+   - Logstash pose un verrou exclusif sur son dossier de données (`data/`). En spécifiant un chemin temporaire comme `/tmp/essai`, on évite tout conflit de verrouillage avec un autre conteneur Logstash déjà en cours d'exécution.
+
+---
+
+## Partie 1 — Recharger les offres avec Logstash
+
+### Exercice 1.2 — Premier lancement (sans le filtre mutate)
+
+1. **Les documents sont-ils indexés ?**
+   - Non, les documents sont tous rejetés par Elasticsearch.
+2. **Quelle erreur Elasticsearch renvoie-t-il, avec quel code HTTP et quel type d'exception ?**
+   - Code HTTP : **`400 Bad Request`**
+   - Type d'exception : **`strict_dynamic_mapping_exception`** (ou `mapping_parsing_exception`).
+3. **Quels noms de champs sont cités ?**
+   - Le premier champ cité est **`@timestamp`**, suivi de `@version`, `event`, `host`, `log`. Ce sont les champs techniques que Logstash ajoute d'office à chaque événement.
+4. **Faites le lien avec `"dynamic": "strict"` (TP 1, ex. 1.4) :**
+   - Dans le TP 1, nous avons configuré l'index `offres` avec la directive `"dynamic": "strict"` pour interdire tout ajout de champ imprévu dans le schéma. Comme ces métadonnées de transport Logstash ne font pas partie du mapping initial de l'index, Elasticsearch respecte scrupuleusement la règle et bloque l'insertion.
+
+---
+
+### Exercice 1.3 — Corriger avec le filtre mutate
+
+1. **Le nombre de documents a-t-il changé ?**
+   - Non, il reste exactement à 5 000 documents (`GET offres/_count`).
+2. **Et le `_version` de `OFF-00002` ? Pourquoi ?**
+   - Le `_version` est passé de 3 à 4. Grâce au paramètre `document_id => "%{id}"`, Logstash transmet l'identifiant métier unique. Elasticsearch met à jour le document existant en place au lieu de créer un doublon (idempotence).
+3. **Pourquoi a-t-on préféré supprimer ces champs plutôt que d'assouplir le mapping de l'index ?**
+   - Pour garantir la pureté du modèle métier. L'index `offres` est un catalogue de recherche fonctionnel destiné aux utilisateurs. Il n'a pas à être alourdi par des données de plomberie technique (`@version`, `@timestamp` d'ingestion, `host.name`), qui augmenteraient inutilement la taille de l'index Lucene.
+4. **Pourquoi l'index `offres` doit-il exister avant le premier démarrage de Logstash ?**
+   - Dans `offres.conf`, `manage_template` est fixé à `false`. Si l'index n'existait pas, Elasticsearch le créerait au vol avec son mapping dynamique par défaut : nous perdrions le type `geo_point` pour la carte, l'analyseur `french`, et la protection `dynamic: strict`.
+
+---
+
+### Exercice 1.4 — Relancer et tester la mémoire
+
+1. **Combien de fois le fichier a-t-il été lu ?**
+   - Il a été relu une fois de plus à chaque redémarrage de Logstash.
+2. **Que se passerait-il avec la sincedb par défaut au lieu de `/dev/null` ?**
+   - Logstash enregistrerait dans sa base locale (sincedb) l'inœud du fichier et le dernier octet lu. Au redémarrage suivant, voyant que le fichier n'a pas été modifié depuis, il ignorerait le fichier et n'ingérerait rien (0 lecture). L'utilisation de `/dev/null` permet de forcer la relecture à chaque lancement en environnement de test.
+3. **Et si `document_id` n'était pas renseigné ?**
+   - Elasticsearch attribuerait un identifiant auto-généré aléatoire à chaque document. À chaque ré-exécution ou redémarrage de Logstash, 5 000 nouveaux documents seraient créés en doublon (5 000, 10 000, 15 000 offres...).
