@@ -541,3 +541,113 @@ Top 10 des offres les plus consultées (requêtes `GET` avec statut `200`) et d�
    - **1. Safari / Mobile Safari :** 8 249 requêtes combinées (4 150 desktop + 4 099 mobile).
    - **2. Chrome / Chrome Mobile :** 8 114 requêtes combinées (4 058 desktop + 4 056 mobile).
    - **3. Firefox :** 4 037 requêtes (uniquement sur desktop Linux).
+
+---
+
+## Partie 5 — Tableau de bord et restitution
+
+### Description des 6 panneaux du tableau de bord « Site de recrutement — trafic »
+
+Le tableau de bord a été conçu dans Kibana avec **Lens** et **Maps** à partir de la data view `logs-web-*` (et `offres` pour la cartographie) sur la période d'observation du 23 au 30 septembre 2026. Les 6 panneaux requis par la consigne sont intégrés et nommés comme suit :
+
+1. **Panneau « Requêtes » (affiché *Nombre de requete*) :**
+   - **Type :** Indicateur métrique (Metric Lens).
+   - **Mesure :** `Count of records` (nombre total d'événements).
+   - **Résultat :** **20 700** requêtes traitées sur la semaine d'analyse.
+
+2. **Panneau « Taux d'erreur serveur » :**
+   - **Type :** Indicateur métrique avec formule personnalisée (Metric Lens).
+   - **Formule Lens :**
+     ```text
+     count(kql='http.response.status_code >= 500') / count()
+     ```
+   - **Formatage :** Pourcentage avec 2 décimales.
+   - **Résultat :** **1,97 %** (soit 407 réponses 5xx sur 20 700 requêtes). Ce taux globalement bas masque en réalité un incident critique concentré dans le temps.
+
+3. **Panneau « Trafic dans le temps » (affiché *Trafic dans le temps par statut HTTP*) :**
+   - **Type :** Barres empilées (Stacked Bar Chart Lens).
+   - **Axe horizontal (X) :** `@timestamp` découpé en intervalles automatiques / 3 heures.
+   - **Axe vertical (Y) :** `Count of records`.
+   - **Décomposition (Breakdown) :** `http.response.status_code`.
+   - **Analyse visuelle :** Le trafic standard apparaît en vert (code 200) à hauteur d'environ 300 à 450 req / bloc. L'incident du lundi 28 septembre ressort immédiatement sous forme d'un bloc distinctif culminant à 402 réponses `503`.
+
+4. **Panneau « Offres les plus consultées » :**
+   - **Type :** Tableau (Data Table Lens).
+   - **Lignes :** Top 10 des valeurs du champ `labels.offre_id`.
+   - **Métrique :** `Count of records`.
+   - **Résultat :** Met en évidence les annonces attirant le plus grand nombre de candidats (menées par `OFF-04662` avec 8 vues, et `OFF-03141` / `OFF-01153` avec 7 vues).
+
+5. **Panneau « Navigateurs » (affiché *Répartition des navigateurs*) :**
+   - **Type :** Anneau (Donut Chart Lens).
+   - **Tranches :** Top 5 des valeurs de `user_agent.name`.
+   - **Résultat :** Répartition équilibrée entre Mobile Safari (19,8 %), Firefox (19,5 %), Chrome (19,6 %), Chrome Mobile (19,59 %) et Safari desktop (19,6 %). Le scanner `zgrab` ne représente que 1,45 % et se retrouve hors du top 5.
+
+6. **Panneau « Offres par ville » (affiché *Carte des offres par ville*) :**
+   - **Type :** Carte interactive (Maps).
+   - **Source de données :** Data view `offres`.
+   - **Couche géographique :** Points basés sur le champ `localisation` (type `geo_point`).
+   - **Visualisation :** Positionnement géographique des 5 000 offres d'emploi sur le territoire métropolitain français (Paris, Lyon, Toulouse, Bordeaux, Lille, Nantes, Montpellier, etc.).
+
+---
+
+### Captures d'écran fournies
+
+1. `captures/tableau-de-bord.png` : Vue d'ensemble nominale du tableau de bord complet (20 700 requêtes, 1,97 % d'erreur, répartition globale).
+2. `captures/tableau-de-bord-interactivite.png` : Vue démontrant l'interactivité par clic sur le code `503` (402 requêtes isolées, taux d'erreur à 100 %, panneau de carte titré).
+
+---
+
+### Interactivité et filtrage croisé (Cross-filtering)
+
+L'interactivité du tableau de bord a été validée :
+- Un clic direct sur la couleur correspondant au code **`503`** (ou sur le pic du 28 septembre) applique instantanément un filtre global KQL `http.response.status_code: 503` à tous les panneaux.
+- **Effets immédiats constatés :**
+  - Le panneau « Nombre de requêtes » s'ajuste à **402**.
+  - Le panneau « Taux d'erreur serveur » monte à **100 %**.
+  - Le tableau « Offres les plus consultées » se vide (car les erreurs 503 ciblaient les endpoints d'API généraux `/api/offres?...` et non des pages de fiches d'offres individuelles comportant un `labels.offre_id`).
+
+---
+
+### Question Bonus — Règle d'alerte (Alerting Kibana)
+
+1. **Pourquoi la règle d'alerte ne se déclenche-t-elle pas sur ces logs ?**
+   - Le moteur d'alerte de Kibana (*Kibana Alerting Framework*) est conçu pour la supervision en production temps réel. Il planifie des requêtes périodiques en interrogeant une fenêtre temporelle glissante par rapport à l'heure système courante : **`now - 5m` à `now`**.
+   - Dans le cadre de ce TP, le jeu de données généré est historique (les événements sont datés du **23 au 30 septembre 2026**). Au moment où la règle tourne aujourd'hui, elle filtre sur l'intervalle `[now - 5 minutes ; now]` qui ne contient aucun document. La condition `count >= 50` évalue donc toujours `0` et l'alerte reste silencieuse.
+
+2. **Comment testeriez-vous cette règle d'alerte ?**
+   - **Procédure de test :**
+     1. Injecter dans le flux de logs une salve d'événements factices portant l'horodatage courant de la machine. Par exemple, avec un script bash ou curl qui génère 60 lignes avec la date du jour `$(date "+%d/%b/%Y:%H:%M:%S %z")` et un code HTTP `503` :
+        ```bash
+        for i in {1..60}; do
+          echo "192.168.1.1 - - [$(date '+%d/%b/%Y:%H:%M:%S %z')] \"GET /api/offres HTTP/1.1\" 503 124 \"-\" \"curl/8.0\"" >> data/access.log
+        done
+        ```
+     2. Logstash lit ces nouvelles lignes via le pipeline `web`, les transforme et les indexe dans `logs-web-default` avec un `@timestamp` compris dans les 5 dernières minutes.
+     3. Au cycle suivant d'évaluation (ex: 1 minute plus tard), la règle détecte 60 erreurs `5xx` dans la fenêtre `now-5m`, franchit le seuil de 50 et déclenche l'action configurée (*Server log* écrivant dans les journaux de Kibana ou envoi d'une notification).
+
+---
+
+### Synthèse de restitution — Rapport d'incident pour l'équipe d'exploitation
+
+**Destinataire :** Équipe d'exploitation & Production  
+**Objet :** Rapport post-mortem — Incident de production du 28/09/2026
+
+#### 1. Chronologie et détection
+- **Début de l'incident :** Lundi 28 septembre 2026 à 14h00 locale (12:00:00 UTC).
+- **Fin de l'incident :** Lundi 28 septembre 2026 à 14h45 locale (12:45:00 UTC).
+- **Durée totale :** 45 minutes consécutives.
+- **Volume d'impact :** **402 requêtes en échec critique HTTP 503 (Service Unavailable)**.
+
+#### 2. Périmètre et surface touchée
+- **Composant défaillant :** L'API backend de recherche d'offres (`/api/offres?ville=...&page=...`).
+- **Services non impactés :** La consultation des pages d'accueil, les fiches détaillées d'offres (`/offres/OFF-...`) et les assets statiques sont restés 100 % opérationnels.
+- **Comportement des clients :** Les applications et navigateurs ont déclenché des boucles de réessai automatique (*retries*), maintenant une charge constante d'environ 45 requêtes par tranche de 5 minutes sur l'API sans engorger le réseau.
+
+#### 3. Incident de sécurité collatéral (Activité suspecte)
+- En amont de l'incident, le samedi 26 septembre à 03h12 (heure locale), un scanner automatisé (`203.0.113.66`, User-Agent `Mozilla/5.0 zgrab/0.x`) a conduit une attaque de reconnaissance de 5 minutes (300 requêtes 404 à 1 req/s) ciblant des chemins sensibles (`/.env`, `/.git/config`, `/admin`, `/wp-login.php`, `/phpmyadmin/`).
+- **Conclusion sécurité :** Aucun fichier sensible n'a été divulgué (toutes les requêtes ont été rejetées en 404).
+
+#### 4. Recommandations et actions correctives
+1. **Supervision & Alerting :** Déployer la règle d'alerte Kibana seuil 5xx (> 50 erreurs / 5 min) connectée au canal d'astreinte (Slack/PagerDuty) pour réduire le temps de détection (MTTD) de 45 minutes à moins de 5 minutes.
+2. **Résilience backend :** Mettre en place un circuit-breaker et un cache intermédiaire sur l'endpoint `/api/offres` pour éviter l'indisponibilité totale en cas de panne temporaire du service sous-jacent.
+3. **Sécurité périmétrique :** Bloquer au niveau du WAF / reverse-proxy les signatures de scanners de vulnérabilités (`zgrab`) et le probing des fichiers cachés (`/.env`, `/.git`).
