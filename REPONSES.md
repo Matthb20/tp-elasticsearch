@@ -273,3 +273,87 @@
    - Logstash enregistrerait dans sa base locale (sincedb) l'inœud du fichier et le dernier octet lu. Au redémarrage suivant, voyant que le fichier n'a pas été modifié depuis, il ignorerait le fichier et n'ingérerait rien (0 lecture). L'utilisation de `/dev/null` permet de forcer la relecture à chaque lancement en environnement de test.
 3. **Et si `document_id` n'était pas renseigné ?**
    - Elasticsearch attribuerait un identifiant auto-généré aléatoire à chaque document. À chaque ré-exécution ou redémarrage de Logstash, 5 000 nouveaux documents seraient créés en doublon (5 000, 10 000, 15 000 offres...).
+
+---
+
+## Partie 2 — Superviser et fiabiliser
+
+### Exercice 2.1 — Superviser via l'API (port 9600)
+
+1. **Combien de pipelines sont chargés, avec combien de workers chacun ?**
+   - **2 pipelines** sont chargés (`offres` et `web`, déclarés dans `pipelines.yml`).
+   - Chacun dispose de **8 workers** (`"workers": 8`). Logstash attribue automatiquement un worker par cœur CPU disponible sur la machine pour paralléliser l'exécution des filtres et des sorties.
+
+2. **Que valent `in`, `filtered` et `out` pour `offres`, et que représentent-ils depuis le dernier démarrage ?**
+   - Valeurs observées : `"in": 5000`, `"filtered": 5000`, `"out": 5000`.
+   - **Ce qu'ils représentent depuis le dernier démarrage :**
+     Ce sont des **compteurs cumulatifs volatils (en RAM)** qui sont remis à zéro (`0`) à chaque démarrage du processus Logstash. Ils mesurent le volume d'événements traités sur la session d'exécution en cours :
+     - `in` : 5 000 événements reçus de la source (`offres.ndjson`).
+     - `filtered` : 5 000 événements passés avec succès à travers les filtres (`mutate`).
+     - `out` : 5 000 événements sortis et acquittés par Elasticsearch.
+     - L'égalité `in == filtered == out == 5000` prouve que sur cette session, 100 % des documents ont été traités sans perte, sans rejet et sans mise en attente (aucun drop).
+
+3. **Quel plugin du pipeline consomme le plus de temps (`duration_in_millis`) ?**
+   - En observant la décomposition des plugins :
+     - Input `file` : ~519 ms
+     - Filter `mutate` : 3 482 ms (~3,5 s)
+     - Output `elasticsearch` : **24 515 ms** (~24,5 s)
+   - C'est très nettement la **sortie `elasticsearch`** qui consomme l'essentiel du temps (~87 %). Le filtre `mutate` travaille en pure mémoire locale CPU, tandis que l'output Elasticsearch effectue des transferts réseau HTTP par lots (`bulk`) et doit attendre l'acquittement d'écriture et d'indexation Lucene sur disque par le cluster.
+
+---
+
+### Exercice 2.2 — Isoler les documents rejetés (Dead Letter Queue)
+
+1. **Le document `OFF-99999` est-il dans l'index ? Où se trouve-t-il ?**
+   - Non, il n'est pas dans l'index Elasticsearch (`GET offres/_doc/OFF-99999` renvoie `found: false`, et le count reste à 5 000).
+   - Il se trouve stocké sur disque dans le répertoire de la Dead Letter Queue : `/usr/share/logstash/data/dead_letter_queue/offres/1.log`.
+
+2. **Quelle raison de refus est enregistrée dans `[@metadata][dead_letter_queue]` ?**
+   - La raison enregistrée est :
+     `"status: 400, error: {"type": "strict_dynamic_mapping_exception", "reason": "mapping set to strict, dynamic introduction of [prime] within [_doc] is not allowed"}"`.
+   - Elasticsearch a rejeté le document car le champ `"prime"` est absent du mapping explicite et l'index est verrouillé en `dynamic: strict`.
+
+3. **Comparez avec `raise_on_error=False` dans `ingest.py` : qu'apporte la DLQ en plus ?**
+   - Dans `ingest.py`, `raise_on_error=False` se contente d'éviter le plantage du script en stockant temporairement les erreurs dans une variable Python. Dès que le script se termine, les données rejetées sont perdues si on n'a pas développé manuellement un système de stockage.
+   - La DLQ de Logstash est une solution industrielle intégrée :
+     - Les documents rejetés et leurs causes sont **sécurisés et persistés sur disque**.
+     - Les métadonnées complètes de l'erreur (code HTTP, stack d'erreur Elasticsearch, horodatage, ID de plugin) sont jointes au document.
+     - Logstash fournit un plugin d'entrée dédié (`input { dead_letter_queue { ... } }`) qui permet de rejouer et retraiter cette file automatiquement avec gestion d'offsets, sans aucune perte de données.
+
+4. **Décrivez en trois étapes comment vous corrigeriez et réinjecteriez ce document :**
+   - **Étape 1 (Diagnostic) :** Inspecter les messages de la DLQ avec un pipeline de lecture pour identifier la cause exacte (champ imprévu, mauvais format de date, etc.).
+   - **Étape 2 (Remédiation) :**
+     - Si le champ est une anomalie/erreur de saisie : créer un pipeline de correction avec un filtre `mutate { remove_field => ["prime"] }`.
+     - Si le champ est une nouvelle information métier légitime : faire évoluer le mapping dans Elasticsearch (`PUT offres/_mapping` avec la nouvelle propriété `"prime": { "type": "integer" }`).
+   - **Étape 3 (Réinjection) :** Exécuter un pipeline de réinjection (`input { dead_letter_queue { ... commit_offsets => true } }` vers `output { elasticsearch { ... } }`) pour réindexer les documents corrigés et vider la DLQ.
+
+---
+
+### Exercice 2.3 — Pourquoi deux pipelines ?
+
+1. **Si le fichier `pipelines.yml` n'était pas monté, combien de pipelines Logstash chargerait-il ?**
+   - Logstash chargerait **un seul et unique pipeline** (appelé `main`).
+
+2. **Dans ce cas, que deviendrait une offre lue dans `offres.ndjson` ? Et une ligne de log d'accès ?**
+   - En l'absence d'isolation, tous les fichiers de configuration du dossier `pipeline/` sont fusionnés : chaque entrée alimente toutes les sorties.
+   - Une offre lue dans `offres.ndjson` serait envoyée à la fois dans l'index `offres` et dans le data stream `logs-web-default` (provoquant des erreurs de typage et polluant les logs d'accès).
+   - Une ligne de log d'accès serait envoyée vers `logs-web-default` et tenterait aussi d'être indexée dans `offres`, où elle se ferait immédiatement rejeter par la règle `dynamic: strict`.
+
+3. **Citez deux autres avantages à isoler les pipelines :**
+   - **Indépendance des réglages et des performances :** Chaque pipeline peut avoir son propre nombre de workers, sa propre taille de batch et sa propre stratégie de mémoire (ex: file persistée sur disque pour les logs critiques, file en RAM pour les offres).
+   - **Résilience et isolation des pannes :** Si le pipeline `web` subit un ralentissement ou un blocage (ex: saturation réseau ou parsing grok lourd), le pipeline `offres` continue de fonctionner à pleine vitesse sans impact.
+
+---
+
+### Exercice 2.4 — Ne rien perdre (file persistée)
+
+1. **Avec la file en mémoire, que deviennent les événements en cas d'arrêt brutal (`docker kill`) ?**
+   - Tous les événements déjà lus depuis la source mais encore en transit dans les filtres ou en attente d'envoi vers Elasticsearch sont **définitivement perdus**.
+
+2. **Quel réglage change ce comportement, et quelle garantie obtient-on ?**
+   - Le réglage est : `queue.type: persisted` (dans `logstash.yml` ou par variable d'environnement).
+   - Avec cette option, chaque événement lu est écrit sur disque avant d'être traité. On obtient la garantie de livraison **« au moins une fois »** (*at least once delivery*) : en cas de panne, les événements sont rejoués au redémarrage.
+
+3. **Pourquoi le `document_id` de la partie 1 devient-il alors indispensable ?**
+   - Avec la garantie « au moins une fois », un événement déjà transmis juste avant un crash peut être renvoyé une deuxième fois au redémarrage.
+   - En fournissant un identifiant déterministe (`document_id => "%{id}"`), Elasticsearch procède à une mise à jour (*upsert*) du document existant au lieu de créer un doublon. L'idempotence transforme ainsi le « au moins une fois » en un résultat **« exactement une fois »** (*exactly once*) effectif dans la base.
